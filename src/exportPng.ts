@@ -158,9 +158,14 @@ export async function renderPng(
   ctx.drawImage(img, 0, 0, cv.width, cv.height);
   ctx.filter = 'none';
 
+  // Scrim painted via `source-atop` so transparent regions of the source PNG
+  // stay transparent in the output rather than getting a white-ish wash.
   const { r, g, b } = hexToRgb(state.scrimColor);
+  ctx.save();
+  ctx.globalCompositeOperation = 'source-atop';
   ctx.fillStyle = `rgba(${r},${g},${b},${state.scrimAlpha})`;
   ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.restore();
 
   for (const c of state.callouts) {
     drawCallout(ctx, img, c, state, cv, scale);

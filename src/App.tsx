@@ -887,7 +887,8 @@ function UploadZone({ onFile }: { onFile: (f: File) => void }) {
           Drop a screenshot
         </div>
         <div style={{ fontSize: 14, color: '#6b6358', marginBottom: 18 }}>
-          PNG or JPEG, any size. We'll keep it sharp.
+          Drop a file, browse, or paste with ⌘V. PNG transparency is
+          preserved.
         </div>
         <button
           style={{
@@ -1289,22 +1290,55 @@ export function App() {
     [],
   );
 
-  const onFile = (f: File) => {
-    setSrcName(f.name);
-    const reader = new FileReader();
-    reader.onload = () => {
-      const url = reader.result as string;
-      const img = new Image();
-      img.onload = () => {
-        setDims({ w: img.naturalWidth, h: img.naturalHeight });
-        setSrc(url);
-        // A new image is a fresh editing context — drop the old undo stack.
-        history.replace(defaultState());
+  const onFile = useCallback(
+    (f: File) => {
+      setSrcName(f.name || 'pasted.png');
+      const reader = new FileReader();
+      reader.onload = () => {
+        const url = reader.result as string;
+        const img = new Image();
+        img.onload = () => {
+          setDims({ w: img.naturalWidth, h: img.naturalHeight });
+          setSrc(url);
+          // A new image is a fresh editing context — drop the old undo stack.
+          history.replace(defaultState());
+        };
+        img.src = url;
       };
-      img.src = url;
+      reader.readAsDataURL(f);
+    },
+    [history],
+  );
+
+  // Paste an image from the clipboard at any time. Skipped if focus is in
+  // a text field (so ⌘V in a contentEditable still does the usual thing).
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.isContentEditable ||
+          target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA')
+      ) {
+        return;
+      }
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of Array.from(items)) {
+        if (item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) {
+            e.preventDefault();
+            onFile(file);
+          }
+          return;
+        }
+      }
     };
-    reader.readAsDataURL(f);
-  };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [onFile]);
 
   const onExport = async () => {
     if (!imgRef.current || !src) return;
