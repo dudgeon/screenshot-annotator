@@ -3,12 +3,37 @@ import {
   useRef,
   useEffect,
   useCallback,
+  useMemo,
   type CSSProperties,
 } from 'react';
-import { DEFAULTS, type Focus, type Caption, type SpotlightState } from './types';
+import {
+  defaultState,
+  addCallout,
+  newCallout,
+  type Focus,
+  type Caption,
+  type Callout,
+  type SpotlightState,
+} from './types';
 import { clamp, rgba, annotatedFilename } from './utils';
 import { useDragPercent } from './useDragPercent';
-import { exportPng } from './exportPng';
+import { useHistoryState } from './useHistoryState';
+import { renderPng, downloadBlob } from './exportPng';
+
+function decodeImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Could not decode source image'));
+    img.src = url;
+  });
+}
+
+const canCopyImage = () =>
+  typeof ClipboardItem !== 'undefined' &&
+  typeof navigator !== 'undefined' &&
+  !!navigator.clipboard?.write;
 
 const STORAGE_KEY = 'spotlight.v1';
 
@@ -16,7 +41,9 @@ type Dims = { w: number; h: number };
 
 /* ---------- Focus rect with corner handles ---------- */
 function FocusRect({
-  focus,
+  callout,
+  selected,
+  onSelect,
   setFocus,
   imgRef,
   imgSrc,
@@ -24,7 +51,9 @@ function FocusRect({
   shadow,
   zoomPct,
 }: {
-  focus: Focus;
+  callout: Callout;
+  selected: boolean;
+  onSelect: () => void;
   setFocus: (f: Focus) => void;
   imgRef: React.RefObject<HTMLImageElement>;
   imgSrc: string;
@@ -32,7 +61,7 @@ function FocusRect({
   shadow: string;
   zoomPct: number;
 }) {
-  const { x, y, w, h } = focus;
+  const { x, y, w, h } = callout.focus;
   const M = 1 + zoomPct / 100;
   const cx = x + w / 2;
   const cy = y + h / 2;
@@ -48,7 +77,7 @@ function FocusRect({
       const ny = clamp(start.y + dy, 0, 100 - start.h);
       setFocus({ ...start, x: nx, y: ny });
     },
-    () => focus,
+    () => callout.focus,
   );
 
   const corners: Array<{ id: 'nw' | 'ne' | 'sw' | 'se'; cur: string }> = [
@@ -58,34 +87,36 @@ function FocusRect({
     { id: 'se', cur: 'nwse-resize' },
   ];
 
-  // Build a drag handler per-corner. useDragPercent uses refs internally, so
-  // it's safe to call once per render per corner — the corner set is fixed.
   const cornerDrag = {
     nw: useDragPercent<Focus>(
       imgRef,
       (dx, dy, start) => resize('nw', dx, dy, start, setFocus),
-      () => focus,
+      () => callout.focus,
     ),
     ne: useDragPercent<Focus>(
       imgRef,
       (dx, dy, start) => resize('ne', dx, dy, start, setFocus),
-      () => focus,
+      () => callout.focus,
     ),
     sw: useDragPercent<Focus>(
       imgRef,
       (dx, dy, start) => resize('sw', dx, dy, start, setFocus),
-      () => focus,
+      () => callout.focus,
     ),
     se: useDragPercent<Focus>(
       imgRef,
       (dx, dy, start) => resize('se', dx, dy, start, setFocus),
-      () => focus,
+      () => callout.focus,
     ),
   };
 
+  const outline = selected
+    ? '0 0 0 1.5px rgba(31, 26, 20, 0.6), 0 0 0 3px rgba(255,255,255,0.5)'
+    : '0 0 0 1px rgba(31, 26, 20, 0.25)';
+
   return (
     <>
-      {/* The crisp lens — same compositing as the README preview */}
+      {/* The crisp lens */}
       <div
         style={{
           position: 'absolute',
@@ -115,9 +146,10 @@ function FocusRect({
         />
       </div>
 
-      {/* invisible body for dragging the whole rect */}
+      {/* invisible body for dragging and selecting the whole rect */}
       <div
         {...moveDrag}
+        onPointerDownCapture={onSelect}
         style={{
           position: 'absolute',
           left: `${x}%`,
@@ -126,35 +158,35 @@ function FocusRect({
           height: `${h}%`,
           cursor: 'move',
           borderRadius: radius,
-          boxShadow:
-            '0 0 0 1.5px rgba(31, 26, 20, 0.6), 0 0 0 3px rgba(255,255,255,0.5)',
+          boxShadow: outline,
         }}
       />
 
-      {/* corner handles — positioned with absolute %, not margin% */}
-      {corners.map((c) => {
-        const isE = c.id.includes('e');
-        const isS = c.id.includes('s');
-        return (
-          <div
-            key={c.id}
-            {...cornerDrag[c.id]}
-            style={{
-              position: 'absolute',
-              width: 14,
-              height: 14,
-              left: `${isE ? x + w : x}%`,
-              top: `${isS ? y + h : y}%`,
-              transform: 'translate(-50%, -50%)',
-              background: '#fff',
-              border: '1.5px solid #1f1a14',
-              borderRadius: 3,
-              cursor: c.cur,
-              boxShadow: '0 1px 2px rgba(0,0,0,.2)',
-            }}
-          />
-        );
-      })}
+      {/* corner handles — only when selected */}
+      {selected &&
+        corners.map((c) => {
+          const isE = c.id.includes('e');
+          const isS = c.id.includes('s');
+          return (
+            <div
+              key={c.id}
+              {...cornerDrag[c.id]}
+              style={{
+                position: 'absolute',
+                width: 14,
+                height: 14,
+                left: `${isE ? x + w : x}%`,
+                top: `${isS ? y + h : y}%`,
+                transform: 'translate(-50%, -50%)',
+                background: '#fff',
+                border: '1.5px solid #1f1a14',
+                borderRadius: 3,
+                cursor: c.cur,
+                boxShadow: '0 1px 2px rgba(0,0,0,.2)',
+              }}
+            />
+          );
+        })}
     </>
   );
 }
@@ -189,22 +221,20 @@ function resize(
 
 /* ---------- Caption block (drag + inline edit) ---------- */
 function CaptionBlock({
-  caption,
+  callout,
+  selected,
+  onSelect,
   setCaption,
-  title,
   setTitle,
-  body,
   setBody,
-  headlineColor,
   imgRef,
 }: {
-  caption: Caption;
+  callout: Callout;
+  selected: boolean;
+  onSelect: () => void;
   setCaption: (c: Caption) => void;
-  title: string;
   setTitle: (s: string) => void;
-  body: string;
   setBody: (s: string) => void;
-  headlineColor: string;
   imgRef: React.RefObject<HTMLImageElement>;
 }) {
   const [editing, setEditing] = useState<'title' | 'body' | null>(null);
@@ -215,18 +245,19 @@ function CaptionBlock({
       const ny = clamp(start.y + dy, 0, 100 - 4);
       setCaption({ ...start, x: nx, y: ny });
     },
-    () => caption,
+    () => callout.caption,
   );
 
   return (
     <div
       style={{
         position: 'absolute',
-        left: `${caption.x}%`,
-        top: `${caption.y}%`,
-        width: `${caption.w}%`,
+        left: `${callout.caption.x}%`,
+        top: `${callout.caption.y}%`,
+        width: `${callout.caption.w}%`,
         color: '#1f1a14',
       }}
+      onPointerDownCapture={onSelect}
     >
       <div
         className="caption-handle"
@@ -247,9 +278,10 @@ function CaptionBlock({
           alignItems: 'center',
           gap: 6,
           cursor: 'move',
-          opacity: 0,
+          opacity: selected ? undefined : 0,
           transition: 'opacity .12s ease',
           userSelect: 'none',
+          pointerEvents: selected ? 'auto' : 'none',
         }}
       >
         <span style={{ fontSize: 10 }}>⠿</span> DRAG
@@ -270,14 +302,14 @@ function CaptionBlock({
           textTransform: 'uppercase',
           fontWeight: 600,
           marginBottom: '1em',
-          color: headlineColor,
+          color: callout.headlineColor,
           outline: editing === 'title' ? '2px solid #c8d4f7' : 'none',
           outlineOffset: 4,
           borderRadius: 2,
           cursor: 'text',
         }}
       >
-        {title}
+        {callout.title}
       </div>
 
       <div
@@ -299,7 +331,7 @@ function CaptionBlock({
           cursor: 'text',
         }}
       >
-        {body}
+        {callout.body}
       </div>
     </div>
   );
@@ -316,15 +348,29 @@ function StylePanel({
   set,
   onReset,
   onExport,
+  onCopy,
+  onAddCallout,
+  onSelectCallout,
+  onDeleteCallout,
+  onSetSelectedHeadlineColor,
   srcName,
   exporting,
+  copying,
+  copied,
 }: {
   s: SpotlightState;
   set: Setter;
   onReset: () => void;
   onExport: () => void;
+  onCopy: () => void;
+  onAddCallout: () => void;
+  onSelectCallout: (id: string) => void;
+  onDeleteCallout: (id: string) => void;
+  onSetSelectedHeadlineColor: (c: string) => void;
   srcName: string | null;
   exporting: boolean;
+  copying: boolean;
+  copied: boolean;
 }) {
   const rowStyle: CSSProperties = {
     display: 'flex',
@@ -395,6 +441,8 @@ function StylePanel({
     </div>
   );
 
+  const selected = s.callouts.find((c) => c.id === s.selectedId) ?? null;
+
   return (
     <aside
       style={{
@@ -430,6 +478,88 @@ function StylePanel({
           Reset
         </button>
       </div>
+
+      <div style={{ ...sectionStyle, borderTop: 0, marginTop: 0, paddingTop: 0 }}>
+        Callouts
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 10 }}>
+        {s.callouts.map((c, i) => {
+          const isSelected = c.id === s.selectedId;
+          return (
+            <div
+              key={c.id}
+              onClick={() => onSelectCallout(c.id)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '6px 8px',
+                borderRadius: 4,
+                background: isSelected ? '#ebe3d0' : 'transparent',
+                cursor: 'pointer',
+                fontSize: 13,
+              }}
+            >
+              <span
+                style={{
+                  width: 18,
+                  height: 18,
+                  borderRadius: '50%',
+                  background: c.headlineColor,
+                  flex: '0 0 auto',
+                  border: '1px solid rgba(0,0,0,0.1)',
+                }}
+              />
+              <span
+                style={{
+                  flex: 1,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  color: '#1f1a14',
+                }}
+              >
+                {c.title || `Callout ${i + 1}`}
+              </span>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDeleteCallout(c.id);
+                }}
+                disabled={s.callouts.length === 1}
+                title={s.callouts.length === 1 ? 'At least one callout required' : 'Delete'}
+                style={{
+                  background: 'transparent',
+                  border: 0,
+                  color: s.callouts.length === 1 ? '#d6c9aa' : '#6b6358',
+                  cursor: s.callouts.length === 1 ? 'not-allowed' : 'pointer',
+                  fontSize: 14,
+                  padding: '0 4px',
+                  lineHeight: 1,
+                }}
+                aria-label="Delete callout"
+              >
+                ×
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      <button
+        onClick={onAddCallout}
+        style={{
+          width: '100%',
+          background: 'transparent',
+          border: '1px dashed #d6c9aa',
+          color: '#1f1a14',
+          padding: '6px 10px',
+          borderRadius: 5,
+          fontSize: 12,
+          cursor: 'pointer',
+        }}
+      >
+        + Add callout
+      </button>
 
       <div style={sectionStyle}>Focus</div>
       <Row label="Backdrop blur" value={`${s.blurPx}px`}>
@@ -501,33 +631,83 @@ function StylePanel({
         />
       </Row>
 
-      <div style={sectionStyle}>Text</div>
-      <Row label="Headline color" value="">
-        <Swatches
-          k="headlineColor"
-          opts={['#c04a2b', '#d97757', '#1f1a14', '#a06a3c', '#2d5a8f', '#5c8a4a']}
-        />
+      <div style={sectionStyle}>
+        {selected ? 'Selected callout' : 'Text'}
+      </div>
+      <Row
+        label={selected ? 'Headline color' : 'Headline color (select a callout)'}
+        value=""
+      >
+        <div style={{ display: 'flex', gap: 6, opacity: selected ? 1 : 0.4 }}>
+          {['#c04a2b', '#d97757', '#1f1a14', '#a06a3c', '#2d5a8f', '#5c8a4a'].map(
+            (o) => (
+              <button
+                key={o}
+                disabled={!selected}
+                onClick={() => onSetSelectedHeadlineColor(o)}
+                aria-label={o}
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: '50%',
+                  border:
+                    selected?.headlineColor === o
+                      ? '2px solid #1f1a14'
+                      : '1px solid #d6c9aa',
+                  background: o,
+                  cursor: selected ? 'pointer' : 'not-allowed',
+                  padding: 0,
+                  boxShadow:
+                    selected?.headlineColor === o ? '0 0 0 2px #fff inset' : 'none',
+                }}
+              />
+            ),
+          )}
+        </div>
       </Row>
 
       <div style={sectionStyle}>Export</div>
-      <button
-        onClick={onExport}
-        disabled={exporting}
-        style={{
-          width: '100%',
-          background: exporting ? '#6b6358' : '#1f1a14',
-          color: '#fff',
-          border: 0,
-          borderRadius: 6,
-          padding: '10px 12px',
-          fontSize: 13,
-          fontWeight: 600,
-          cursor: exporting ? 'wait' : 'pointer',
-          letterSpacing: '.01em',
-        }}
-      >
-        {exporting ? 'Exporting…' : 'Export PNG'}
-      </button>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button
+          onClick={onExport}
+          disabled={exporting}
+          style={{
+            flex: 1,
+            background: exporting ? '#6b6358' : '#1f1a14',
+            color: '#fff',
+            border: 0,
+            borderRadius: 6,
+            padding: '10px 12px',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: exporting ? 'wait' : 'pointer',
+            letterSpacing: '.01em',
+          }}
+        >
+          {exporting ? 'Exporting…' : 'Export PNG'}
+        </button>
+        <button
+          onClick={onCopy}
+          disabled={copying}
+          title="Copy PNG to clipboard"
+          style={{
+            flex: '0 0 auto',
+            background: copied ? '#5c8a4a' : 'transparent',
+            color: copied ? '#fff' : '#1f1a14',
+            border: copied ? '0' : '1px solid #d6c9aa',
+            borderRadius: 6,
+            padding: '10px 12px',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: copying ? 'wait' : 'pointer',
+            letterSpacing: '.01em',
+            transition: 'background .15s ease, color .15s ease',
+            minWidth: 90,
+          }}
+        >
+          {copied ? 'Copied!' : copying ? 'Copying…' : 'Copy'}
+        </button>
+      </div>
       <div
         style={{
           marginTop: 8,
@@ -547,7 +727,7 @@ function StylePanel({
         >
           ![](…)
         </code>
-        .
+        , or paste straight into a GitHub comment with Copy.
       </div>
 
       {srcName && (
@@ -735,18 +915,70 @@ function UploadZone({ onFile }: { onFile: (f: File) => void }) {
   );
 }
 
+/* ---------- Single callout's editable layer ---------- */
+function CalloutLayer({
+  callout,
+  selected,
+  onSelect,
+  setCallout,
+  imgRef,
+  imgSrc,
+  radius,
+  shadow,
+  zoomPct,
+}: {
+  callout: Callout;
+  selected: boolean;
+  onSelect: () => void;
+  setCallout: (partial: Partial<Callout>) => void;
+  imgRef: React.RefObject<HTMLImageElement>;
+  imgSrc: string;
+  radius: number;
+  shadow: string;
+  zoomPct: number;
+}) {
+  return (
+    <>
+      <FocusRect
+        callout={callout}
+        selected={selected}
+        onSelect={onSelect}
+        setFocus={(f) => setCallout({ focus: f })}
+        imgRef={imgRef}
+        imgSrc={imgSrc}
+        radius={radius}
+        shadow={shadow}
+        zoomPct={zoomPct}
+      />
+      <CaptionBlock
+        callout={callout}
+        selected={selected}
+        onSelect={onSelect}
+        setCaption={(c) => setCallout({ caption: c })}
+        setTitle={(t) => setCallout({ title: t })}
+        setBody={(b) => setCallout({ body: b })}
+        imgRef={imgRef}
+      />
+    </>
+  );
+}
+
 /* ---------- Main editor stage ---------- */
 function EditorStage({
   imgSrc,
   imgDims,
   state,
   set,
+  setCallout,
+  selectCallout,
   imgRef,
 }: {
   imgSrc: string;
   imgDims: Dims | null;
   state: SpotlightState;
   set: Setter;
+  setCallout: (id: string, partial: Partial<Callout>) => void;
+  selectCallout: (id: string | null) => void;
   imgRef: React.RefObject<HTMLImageElement>;
 }) {
   const sBlur = Math.round(state.shadowSize * 0.9);
@@ -757,6 +989,10 @@ function EditorStage({
   )}), 0 0 0 1px rgba(255,255,255,.5) inset`;
 
   const aspect = imgDims ? `${imgDims.w} / ${imgDims.h}` : '16 / 9';
+
+  // Used by the consumer of `set` for global keys; cast is safe because we
+  // never call this for nested callout keys.
+  void set;
 
   return (
     <div
@@ -770,6 +1006,10 @@ function EditorStage({
         justifyContent: 'center',
         overflow: 'hidden',
         position: 'relative',
+      }}
+      onPointerDown={(e) => {
+        // Deselect when clicking on empty stage background.
+        if (e.target === e.currentTarget) selectCallout(null);
       }}
     >
       <div
@@ -810,26 +1050,26 @@ function EditorStage({
         <div
           style={{ position: 'absolute', inset: 0 }}
           className="annot-layer"
+          onPointerDown={(e) => {
+            // Clicking inside the annotation layer but not on a callout
+            // also deselects.
+            if (e.target === e.currentTarget) selectCallout(null);
+          }}
         >
-          <FocusRect
-            focus={state.focus}
-            setFocus={(f) => set('focus', f)}
-            imgRef={imgRef}
-            imgSrc={imgSrc}
-            radius={state.lensRadius}
-            shadow={shadow}
-            zoomPct={state.lensZoom}
-          />
-          <CaptionBlock
-            caption={state.caption}
-            setCaption={(c) => set('caption', c)}
-            title={state.title}
-            setTitle={(v) => set('title', v)}
-            body={state.body}
-            setBody={(v) => set('body', v)}
-            headlineColor={state.headlineColor}
-            imgRef={imgRef}
-          />
+          {state.callouts.map((c) => (
+            <CalloutLayer
+              key={c.id}
+              callout={c}
+              selected={c.id === state.selectedId}
+              onSelect={() => selectCallout(c.id)}
+              setCallout={(partial) => setCallout(c.id, partial)}
+              imgRef={imgRef}
+              imgSrc={imgSrc}
+              radius={state.lensRadius}
+              shadow={shadow}
+              zoomPct={state.lensZoom}
+            />
+          ))}
         </div>
       </div>
     </div>
@@ -844,13 +1084,47 @@ type Persisted = {
   state: SpotlightState;
 };
 
+// Old shape (pre-multi-callout): single focus/caption/title/body/headlineColor
+// flat on state. Convert to a single callout to preserve user work.
+type LegacyState = Partial<SpotlightState> & {
+  focus?: Focus;
+  caption?: Caption;
+  title?: string;
+  body?: string;
+  headlineColor?: string;
+};
+
+function migrateState(raw: unknown): SpotlightState {
+  const base = defaultState();
+  if (!raw || typeof raw !== 'object') return base;
+  const r = raw as LegacyState;
+  if (Array.isArray(r.callouts) && r.callouts.length > 0) {
+    return { ...base, ...(r as Partial<SpotlightState>) } as SpotlightState;
+  }
+  if (r.focus) {
+    const c = newCallout({
+      focus: r.focus,
+      caption: r.caption ?? base.callouts[0].caption,
+      title: r.title ?? base.callouts[0].title,
+      body: r.body ?? base.callouts[0].body,
+      headlineColor: r.headlineColor ?? base.callouts[0].headlineColor,
+    });
+    return {
+      ...base,
+      ...(r as Partial<SpotlightState>),
+      callouts: [c],
+      selectedId: c.id,
+    };
+  }
+  return base;
+}
+
 function loadPersisted(): Persisted | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const p = JSON.parse(raw) as Persisted;
-    // Backfill any missing keys (forward-compatible).
-    p.state = { ...DEFAULTS, ...p.state };
+    p.state = migrateState(p.state);
     return p;
   } catch {
     return null;
@@ -861,38 +1135,159 @@ function savePersisted(p: Persisted) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
   } catch {
-    // Quota or serialization issue — fail silently; a too-large image is the
-    // most likely cause, and the user can reload it on demand.
+    // Quota / serialization issue — too-large image is the likely cause;
+    // user can reload it.
   }
 }
 
 /* ---------- Root ---------- */
 export function App() {
-  const [src, setSrc] = useState<string | null>(null);
-  const [srcName, setSrcName] = useState<string | null>(null);
-  const [dims, setDims] = useState<Dims | null>(null);
-  const [state, setState] = useState<SpotlightState>(DEFAULTS);
+  const persisted = useMemo(() => loadPersisted(), []);
+  const [src, setSrc] = useState<string | null>(persisted?.src ?? null);
+  const [srcName, setSrcName] = useState<string | null>(persisted?.srcName ?? null);
+  const [dims, setDims] = useState<Dims | null>(persisted?.dims ?? null);
+  const [state, setState, history] = useHistoryState<SpotlightState>(
+    () => persisted?.state ?? defaultState(),
+  );
   const [exporting, setExporting] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [copied, setCopied] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
 
-  // Hydrate from localStorage on mount.
   useEffect(() => {
-    const p = loadPersisted();
-    if (!p) return;
-    setSrc(p.src);
-    setSrcName(p.srcName);
-    setDims(p.dims);
-    setState(p.state);
-  }, []);
+    if (!copied) return;
+    const t = window.setTimeout(() => setCopied(false), 1800);
+    return () => window.clearTimeout(t);
+  }, [copied]);
 
-  // Persist on every change.
   useEffect(() => {
     savePersisted({ src, srcName, dims, state });
   }, [src, srcName, dims, state]);
 
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const inEditable =
+        !!target &&
+        (target.isContentEditable ||
+          target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA');
+
+      const mod = e.metaKey || e.ctrlKey;
+      const k = e.key.toLowerCase();
+
+      // Cmd/Ctrl+Z / Cmd/Ctrl+Shift+Z always handled at the app level,
+      // even inside text editing — contentEditable's native undo doesn't
+      // capture our state changes anyway.
+      if (mod && k === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) history.redo();
+        else history.undo();
+        return;
+      }
+      if (mod && k === 'y') {
+        e.preventDefault();
+        history.redo();
+        return;
+      }
+
+      if (inEditable) return;
+
+      if (e.key === 'Escape') {
+        (document.activeElement as HTMLElement | null)?.blur?.();
+        setState((s) => (s.selectedId === null ? s : { ...s, selectedId: null }));
+        return;
+      }
+
+      const arrows = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+      if (arrows.includes(e.key)) {
+        const step = e.shiftKey ? 5 : 1;
+        const dx = e.key === 'ArrowRight' ? step : e.key === 'ArrowLeft' ? -step : 0;
+        const dy = e.key === 'ArrowDown' ? step : e.key === 'ArrowUp' ? -step : 0;
+        let handled = false;
+        setState((s) => {
+          if (!s.selectedId) return s;
+          handled = true;
+          return {
+            ...s,
+            callouts: s.callouts.map((c) =>
+              c.id === s.selectedId
+                ? {
+                    ...c,
+                    focus: {
+                      ...c.focus,
+                      x: clamp(c.focus.x + dx, 0, 100 - c.focus.w),
+                      y: clamp(c.focus.y + dy, 0, 100 - c.focus.h),
+                    },
+                  }
+                : c,
+            ),
+          };
+        });
+        if (handled) e.preventDefault();
+        return;
+      }
+
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        let handled = false;
+        setState((s) => {
+          if (!s.selectedId || s.callouts.length === 1) return s;
+          handled = true;
+          const next = s.callouts.filter((c) => c.id !== s.selectedId);
+          return { ...s, callouts: next, selectedId: next[0].id };
+        });
+        if (handled) e.preventDefault();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [history, setState]);
+
   const set: Setter = useCallback((key, value) => {
     setState((s) => ({ ...s, [key]: value }));
   }, []);
+
+  const setCallout = useCallback((id: string, partial: Partial<Callout>) => {
+    setState((s) => ({
+      ...s,
+      callouts: s.callouts.map((c) => (c.id === id ? { ...c, ...partial } : c)),
+    }));
+  }, []);
+
+  const selectCallout = useCallback((id: string | null) => {
+    setState((s) => (s.selectedId === id ? s : { ...s, selectedId: id }));
+  }, []);
+
+  const onAddCallout = useCallback(() => {
+    setState((s) => addCallout(s));
+  }, []);
+
+  const onDeleteCallout = useCallback((id: string) => {
+    setState((s) => {
+      if (s.callouts.length === 1) return s;
+      const next = s.callouts.filter((c) => c.id !== id);
+      return {
+        ...s,
+        callouts: next,
+        selectedId: s.selectedId === id ? next[0].id : s.selectedId,
+      };
+    });
+  }, []);
+
+  const onSetSelectedHeadlineColor = useCallback(
+    (color: string) => {
+      setState((s) => {
+        if (!s.selectedId) return s;
+        return {
+          ...s,
+          callouts: s.callouts.map((c) =>
+            c.id === s.selectedId ? { ...c, headlineColor: color } : c,
+          ),
+        };
+      });
+    },
+    [],
+  );
 
   const onFile = (f: File) => {
     setSrcName(f.name);
@@ -903,7 +1298,8 @@ export function App() {
       img.onload = () => {
         setDims({ w: img.naturalWidth, h: img.naturalHeight });
         setSrc(url);
-        setState(DEFAULTS);
+        // A new image is a fresh editing context — drop the old undo stack.
+        history.replace(defaultState());
       };
       img.src = url;
     };
@@ -914,23 +1310,46 @@ export function App() {
     if (!imgRef.current || !src) return;
     setExporting(true);
     try {
-      // Decode an independent off-DOM image so we hit `naturalWidth` even if
-      // the stage img is currently CSS-scaled.
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      const loaded = new Promise<HTMLImageElement>((resolve, reject) => {
-        img.onload = () => resolve(img);
-        img.onerror = () => reject(new Error('Could not decode source image'));
-      });
-      img.src = src;
-      const decoded = await loaded;
-      await exportPng(decoded, state, annotatedFilename(srcName));
+      const decoded = await decodeImage(src);
+      const stageWidth = imgRef.current.getBoundingClientRect().width;
+      const blob = await renderPng(decoded, state, stageWidth);
+      downloadBlob(blob, annotatedFilename(srcName));
     } catch (err) {
       console.error(err);
       alert('Export failed: ' + (err as Error).message);
     } finally {
       setExporting(false);
     }
+  };
+
+  // Build the blob promise synchronously inside the click handler so Safari
+  // accepts `new ClipboardItem({ 'image/png': promise })` — Safari requires
+  // the ClipboardItem be constructed in the same user-gesture task.
+  const onCopy = () => {
+    if (!imgRef.current || !src) return;
+    const stageWidth = imgRef.current.getBoundingClientRect().width;
+    const blobPromise = decodeImage(src).then((decoded) =>
+      renderPng(decoded, state, stageWidth),
+    );
+
+    if (!canCopyImage()) {
+      setCopying(true);
+      blobPromise
+        .then((blob) => downloadBlob(blob, annotatedFilename(srcName)))
+        .catch((err) => alert('Copy failed: ' + (err as Error).message))
+        .finally(() => setCopying(false));
+      return;
+    }
+
+    setCopying(true);
+    navigator.clipboard
+      .write([new ClipboardItem({ 'image/png': blobPromise })])
+      .then(() => setCopied(true))
+      .catch((err) => {
+        console.error(err);
+        alert('Copy failed: ' + (err as Error).message);
+      })
+      .finally(() => setCopying(false));
   };
 
   const onReplace = () => {
@@ -957,15 +1376,24 @@ export function App() {
               imgDims={dims}
               state={state}
               set={set}
+              setCallout={setCallout}
+              selectCallout={selectCallout}
               imgRef={imgRef}
             />
             <StylePanel
               s={state}
               set={set}
-              onReset={() => setState(DEFAULTS)}
+              onReset={() => setState(defaultState())}
               onExport={onExport}
+              onCopy={onCopy}
+              onAddCallout={onAddCallout}
+              onSelectCallout={selectCallout}
+              onDeleteCallout={onDeleteCallout}
+              onSetSelectedHeadlineColor={onSetSelectedHeadlineColor}
               srcName={srcName}
               exporting={exporting}
+              copying={copying}
+              copied={copied}
             />
           </>
         ) : (

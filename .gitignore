@@ -5,3 +5,4 @@ dist
 tsconfig.tsbuildinfo
 design_files/
 design.tar.gz
+.claude/

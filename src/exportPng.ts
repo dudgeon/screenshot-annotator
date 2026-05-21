@@ -1,5 +1,5 @@
 import { hexToRgb } from './utils';
-import type { SpotlightState } from './types';
+import type { Callout, SpotlightState } from './types';
 
 function roundedRect(
   ctx: CanvasRenderingContext2D,
@@ -19,7 +19,6 @@ function roundedRect(
   ctx.closePath();
 }
 
-// Wrap a single line of body text to the given px width.
 function wrapText(
   ctx: CanvasRenderingContext2D,
   text: string,
@@ -41,51 +40,23 @@ function wrapText(
   return lines;
 }
 
-export async function exportPng(
+function drawCallout(
+  ctx: CanvasRenderingContext2D,
   img: HTMLImageElement,
+  callout: Callout,
   state: SpotlightState,
-  filename: string,
-): Promise<void> {
-  const cv = document.createElement('canvas');
-  cv.width = img.naturalWidth;
-  cv.height = img.naturalHeight;
-  const ctx = cv.getContext('2d');
-  if (!ctx) throw new Error('No 2D context');
-
-  // The live preview's `blurPx` is in CSS px relative to the rendered DOM
-  // size. The HANDOFF spells out that the export must scale by
-  // cv.width / renderedStageWidth to match what the user saw. We do not have
-  // a reliable renderedStageWidth here without coupling, so we treat the
-  // prototype's "default editor stage width ~ 960px" as the reference. This
-  // approximation matches the live preview at typical README image widths.
-  // Anyone who wants pixel-perfect parity should pass through a measured
-  // stage width.
-  const referenceStageWidth = 960;
-  const scale = cv.width / referenceStageWidth;
-
-  // 1. Blurred screenshot
-  ctx.filter = `blur(${state.blurPx * scale}px) saturate(0.9)`;
-  ctx.drawImage(img, 0, 0, cv.width, cv.height);
-  ctx.filter = 'none';
-
-  // 2. Lightening scrim
-  const { r, g, b } = hexToRgb(state.scrimColor);
-  ctx.fillStyle = `rgba(${r},${g},${b},${state.scrimAlpha})`;
-  ctx.fillRect(0, 0, cv.width, cv.height);
-
-  // 3. Focus lens
+  cv: HTMLCanvasElement,
+  scale: number,
+) {
   const focusPx = {
-    x: (state.focus.x / 100) * cv.width,
-    y: (state.focus.y / 100) * cv.height,
-    w: (state.focus.w / 100) * cv.width,
-    h: (state.focus.h / 100) * cv.height,
+    x: (callout.focus.x / 100) * cv.width,
+    y: (callout.focus.y / 100) * cv.height,
+    w: (callout.focus.w / 100) * cv.width,
+    h: (callout.focus.h / 100) * cv.height,
   };
   const lensRadius = state.lensRadius * scale;
 
-  // 3a. Shadow under the lens. The shadow math mirrors EditorStage:
-  //   sBlur  = round(shadowSize * 0.9)
-  //   sY     = round(shadowDepth * 0.45)
-  //   sAlpha = min(0.75, 0.18 + shadowDepth / 180)
+  // Shadow under the lens. Math mirrors EditorStage's box-shadow.
   const sBlur = state.shadowSize * 0.9 * scale;
   const sY = state.shadowDepth * 0.45 * scale;
   const sAlpha = Math.min(0.75, 0.18 + state.shadowDepth / 180);
@@ -99,15 +70,13 @@ export async function exportPng(
   ctx.fill();
   ctx.restore();
 
-  // 3b. Clip to the rounded rect and draw the (optionally magnified) crop.
+  // Clip to the rounded rect and draw the (optionally magnified) crop.
   ctx.save();
   roundedRect(ctx, focusPx.x, focusPx.y, focusPx.w, focusPx.h, lensRadius);
   ctx.clip();
   const M = 1 + state.lensZoom / 100;
   const cx = focusPx.x + focusPx.w / 2;
   const cy = focusPx.y + focusPx.h / 2;
-  // Source crop in image pixels. The screenshot is drawn 1:1 to the canvas,
-  // so canvas px === image px.
   const srcW = focusPx.w / M;
   const srcH = focusPx.h / M;
   ctx.drawImage(
@@ -136,64 +105,92 @@ export async function exportPng(
   ctx.stroke();
   ctx.restore();
 
-  // 4. Caption text.
-  // The live preview uses clamp(14px, 1.3vw, 22px) for the headline and
-  // clamp(20px, 2vw, 34px) for the body — i.e. tied to viewport. The HANDOFF
-  // says the EXPORTED text should be a proportion of the *image* width:
-  //   headline ≈ 1.3% of image width
-  //   body     ≈ 2.0% of image width
+  // Caption text. Sizes are a proportion of image width — matches HANDOFF.
   const headlinePx = Math.round(cv.width * 0.013);
   const bodyPx = Math.round(cv.width * 0.020);
-  const capX = (state.caption.x / 100) * cv.width;
-  const capY = (state.caption.y / 100) * cv.height;
-  const capW = (state.caption.w / 100) * cv.width;
+  const capX = (callout.caption.x / 100) * cv.width;
+  const capY = (callout.caption.y / 100) * cv.height;
+  const capW = (callout.caption.w / 100) * cv.width;
 
-  ctx.fillStyle = state.headlineColor;
+  ctx.fillStyle = callout.headlineColor;
   ctx.textBaseline = 'top';
   ctx.font = `600 ${headlinePx}px Inter, system-ui, sans-serif`;
+  type CtxWithLetterSpacing = CanvasRenderingContext2D & { letterSpacing?: string };
   try {
-    (ctx as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing =
-      `${headlinePx * 0.22}px`;
+    (ctx as CtxWithLetterSpacing).letterSpacing = `${headlinePx * 0.22}px`;
   } catch {
-    /* unsupported; fall through */
+    /* unsupported */
   }
-  const headlineText = state.title.toUpperCase();
-  ctx.fillText(headlineText, capX, capY);
-
-  // Reset letter-spacing before the body.
+  ctx.fillText(callout.title.toUpperCase(), capX, capY);
   try {
-    (ctx as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing =
-      '0px';
+    (ctx as CtxWithLetterSpacing).letterSpacing = '0px';
   } catch {
     /* unsupported */
   }
 
-  // 1em of headline = headlinePx margin between the two.
+  // 1em of headline below = headlinePx of margin.
   const bodyTop = capY + headlinePx + headlinePx;
   ctx.fillStyle = '#1f1a14';
   ctx.font = `400 ${bodyPx}px Inter, system-ui, sans-serif`;
-  const bodyLines = wrapText(ctx, state.body, capW);
+  const bodyLines = wrapText(ctx, callout.body, capW);
   const bodyLineHeight = bodyPx * 1.35;
   bodyLines.forEach((line, i) => {
     ctx.fillText(line, capX, bodyTop + i * bodyLineHeight);
   });
+}
 
-  // 5. Trigger download.
-  await new Promise<void>((resolve, reject) => {
+export async function renderPng(
+  img: HTMLImageElement,
+  state: SpotlightState,
+  renderedStageWidth: number,
+): Promise<Blob> {
+  const cv = document.createElement('canvas');
+  cv.width = img.naturalWidth;
+  cv.height = img.naturalHeight;
+  const ctx = cv.getContext('2d');
+  if (!ctx) throw new Error('No 2D context');
+
+  // `blurPx` and shadow values in state are CSS px against the rendered
+  // stage. Scale by canvas-px / stage-css-px to match the live preview.
+  const scale = cv.width / renderedStageWidth;
+
+  ctx.filter = `blur(${state.blurPx * scale}px) saturate(0.9)`;
+  ctx.drawImage(img, 0, 0, cv.width, cv.height);
+  ctx.filter = 'none';
+
+  const { r, g, b } = hexToRgb(state.scrimColor);
+  ctx.fillStyle = `rgba(${r},${g},${b},${state.scrimAlpha})`;
+  ctx.fillRect(0, 0, cv.width, cv.height);
+
+  for (const c of state.callouts) {
+    drawCallout(ctx, img, c, state, cv, scale);
+  }
+
+  return new Promise<Blob>((resolve, reject) => {
     cv.toBlob((blob) => {
-      if (!blob) {
-        reject(new Error('Failed to encode PNG'));
-        return;
-      }
-      const a = document.createElement('a');
-      const url = URL.createObjectURL(blob);
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      resolve();
+      if (!blob) reject(new Error('Failed to encode PNG'));
+      else resolve(blob);
     }, 'image/png');
   });
+}
+
+export function downloadBlob(blob: Blob, filename: string) {
+  const a = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export async function exportPng(
+  img: HTMLImageElement,
+  state: SpotlightState,
+  filename: string,
+  renderedStageWidth: number,
+): Promise<void> {
+  const blob = await renderPng(img, state, renderedStageWidth);
+  downloadBlob(blob, filename);
 }
